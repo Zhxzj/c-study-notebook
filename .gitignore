@@ -1,0 +1,7 @@
+user-data/
+updates/
+__pycache__/
+*.pyc
+*.sqlite*
+*.log
+server.json
