@@ -1,13 +1,11 @@
-# C · 学习手记 3.0.1
+# C 学习手记 4.3.0
 
-Windows 便携版：在 Releases 下载 C-Study-3.0.1-portable.zip，右键全部解压到可写目录，再双击“打开教材.cmd”。无需安装 Python 或 Node。首次打开会创建空白个人档案并打开浏览器。停止服务请双击“停止教材.cmd”。请勿直接在压缩包内运行。
+Windows 10/11 64 位用户可双击安装包，安装后从桌面快捷方式打开。安装包自带 Python、GCC 和代码整理工具。便携版解压后双击“打开教材.cmd”。[下载发行版](https://github.com/Zhxzj/c-study-notebook/releases/tag/v4.3.0)
 
-程序未进行代码签名，Windows 可能显示安全提示；请核对下载来源和 SHA256。网页学习开箱即用，网站不能编译 C；实际编译所需的 VS Code 与编译器配置见课程。
+升级时选择原安装目录。学习数据保存在该目录的 user-data 文件夹，升级和卸载会保留。迁移电脑时可在学习记录页导出和导入。
 
-个人数据保存在解压目录 user-data，备份也在该目录，可在网页设置第二位置备份。请定期将整个 user-data 复制到另一磁盘。不要将个人数据上传到 GitHub。
+56 课涵盖 C 语言教材主线和拓展。4.3.0 补充中文注释、954 个推演步骤、独立阅读题和日常编程题。
 
-升级：先解压新版到另一目录，保留原目录。使用原目录 runtime/python.exe 运行 tools/safe_update.py --root "原目录" --source "新版目录/app"。此更新器执行保存握手、SQLite 快照、完整记录校验和失败回退。请勿直接覆盖运行中的 app。便携版没有系统卸载程序；停止服务后移除 app、tools、runtime 和启动脚本，保留 user-data 即保留记录。
+构建安装包时，将应用、启动脚本、工具及第三方运行环境放入 distribution 目录，再用 Inno Setup 7 编译 installer.iss。第三方版本及来源见 SOURCE_ACCESS.md。
 
-源码内容版本为 3.0.1；发行修复了空白安装首次启动时创建数据目录的问题。随附 Python 运行时许可位于 runtime/LICENSE.txt。课程包括 32 课主线与两条共 24 课拓展路线。
-
-本次发行暂为预发布便携版，正式安装 EXE 尚未提供。自动生成的 Source code 压缩包面向开发者，新手请下载 portable.zip。
+随包 GCC 要求安装或解压目录使用英文字母、数字和空格。安装包未签名，可通过发行页的 SHA256.txt 核对下载文件。

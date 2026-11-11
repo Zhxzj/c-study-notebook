@@ -5,21 +5,46 @@ import sqlite3, subprocess, sys, tempfile, threading, time, traceback, urllib.pa
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from contextlib import closing, contextmanager
+from functools import lru_cache
 
 APP=Path(__file__).resolve().parent
 ROOT=APP.parent
 COURSE=json.loads((APP/'course.json').read_text(encoding='utf-8'))
 QUESTIONS={q['id']:q for l in COURSE['lessons'] for q in l['questions']}
 QUESTIONS.update({q['id']:q for q in COURSE.get('extra_questions',[])})
+PRACTICE=json.loads((APP/'practice.json').read_text(encoding='utf-8'))
+QUESTIONS.update({q['id']:q for q in PRACTICE})
+QUESTION_ARCHIVE=json.loads((APP/'question-archive.json').read_text(encoding='utf-8')) if (APP/'question-archive.json').exists() else {}
+sys.path.insert(0,str(APP))
+from local_judge import judge, GATE as JUDGE_GATE
+from encouragement import choose as choose_praise
 LESSON_IDS={l['id'] for l in COURSE['lessons']}
 TOKEN=secrets.token_urlsafe(32)
 LOCK=threading.RLock()
 BOOT_ID=uuid.uuid4().hex
 UPDATE={'phase':'idle','clients':{}}
 
-def now(): return dt.datetime.now().astimezone().isoformat(timespec='seconds')
+def now(): return dt.datetime.now().astimezone().isoformat(timespec='microseconds')
 def dumps(v): return json.dumps(v,ensure_ascii=False,separators=(',',':'))
 def norm(v): return '\n'.join(x.rstrip() for x in str(v).replace('\r\n','\n').splitlines()).strip()
+def public_question(q):
+    return {k:v for k,v in q.items() if k not in {'answer','reference','explanation','solution_steps','reference_walk43'}}
+
+def public_content(value):
+    if isinstance(value,list):return [public_content(x) for x in value]
+    if isinstance(value,dict):
+        if value.get('id') in QUESTIONS:return public_question(value)
+        return {k:public_content(v) for k,v in value.items()}
+    return value
+
+def used_praise(c):
+    ids=set()
+    for row in c.execute("SELECT value FROM records WHERE key LIKE 'draft:%' OR key LIKE 'checkin:%'"):
+        value=json.loads(row[0])
+        for field in ('earned_praise_id','cheer_id'):
+            if isinstance(value.get(field),str):ids.add(value[field])
+    return ids
+
 def schema(c):
     c.executescript('''PRAGMA synchronous=FULL;
     CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
@@ -65,52 +90,125 @@ class Store:
         if self.broken: raise ValueError('数据库处于恢复模式，请先从有效备份恢复。')
     def patch(self,key,patch):
         self.ensure()
-        if not re.fullmatch(r'(profile|lesson:l\d{2}|draft:q\d{2}[abc]|paper:(paper[123]|diagnostic)|scope:\d{1,2}|checkin:\d{4}-\d{2}-\d{2})',key): raise ValueError('无效记录名称')
+        if not re.fullmatch(r'(profile|lesson:l\d{2}|draft:(?:q\d{2}[abc]|[hd]\d{2}[a-h])|paper:(paper[123]|diagnostic)|scope:\d{1,2}|checkin:\d{4}-\d{2}-\d{2})',key): raise ValueError('无效记录名称')
         if not isinstance(patch,dict) or len(dumps(patch))>200000: raise ValueError('记录格式或长度不正确')
         if key.startswith('checkin:'):
             dt.date.fromisoformat(key[8:])
             if set(patch)-{'message','message_updated'} or not isinstance(patch.get('message',''),str) or len(patch.get('message',''))>4000: raise ValueError('留言格式不正确')
+        if key.startswith('draft:') and set(patch)&{'earned_praise','earned_praise_id','earned_praise_event','first_passed_at'}:raise ValueError('通过奖励由系统保存')
         if key.startswith('lesson:') and key[7:] not in LESSON_IDS: raise ValueError('未知课程')
         with LOCK, self.connect() as c:
             row=c.execute('SELECT value FROM records WHERE key=?',(key,)).fetchone()
-            value=json.loads(row[0]) if row else {}; value.update(patch)
+            value=json.loads(row[0]) if row else {}
+            if key=='profile':
+                incoming=dict(patch)
+                for field in ('chapterResume41','trackResume41'):
+                    if field in incoming:
+                        changes=incoming.pop(field)
+                        if not isinstance(changes,dict):raise ValueError('续学位置格式不正确')
+                        merged=dict(value.get(field,{})).copy()
+                        for name,position in changes.items():
+                            if not isinstance(position,dict):raise ValueError('续学位置格式不正确')
+                            previous=merged.get(name,{})
+                            if str(position.get('stamp',''))>=str(previous.get('stamp','')):merged[name]=position
+                        value[field]=merged
+                old_resume=value.get('lastStudy41')
+                if old_resume and 'lastStudy41' in incoming and str(incoming['lastStudy41'].get('stamp',''))<str(old_resume.get('stamp','')):
+                    incoming.pop('lastStudy41');incoming['currentLesson']=old_resume['lesson']
+                value.update(incoming)
+            else:value.update(patch)
+            if key.startswith('draft:') and patch.get('reveal'):value['reveal_at']=now()
             stamp=now()
             c.execute('INSERT INTO records VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated=excluded.updated',(key,dumps(value),stamp)); c.commit()
         self.daily(); return {'value':value,'saved_at':stamp}
-    def attempt(self,p):
-        self.ensure(); qid=p.get('qid'); q=QUESTIONS.get(qid)
-        if not q: raise ValueError('没有找到题目')
+    def attempt(self,p,verified=False):
+        self.ensure();qid=p.get('qid');q=QUESTIONS.get(qid)
+        if not q:raise ValueError('没有找到题目')
+        if q['type']=='program' and not verified:raise ValueError('本题需要通过本机编译检查，不能自评通过')
         event=p.get('event_id','')
-        if not re.fullmatch(r'[a-zA-Z0-9-]{12,80}',event): raise ValueError('提交标识不正确')
+        if not re.fullmatch(r'[a-zA-Z0-9-]{12,80}',event):raise ValueError('提交标识不正确')
         answer=p.get('answer','')
-        if not isinstance(answer,str) or len(answer)>100000: raise ValueError('答案长度不正确')
-        assisted=bool(p.get('assisted')); correct=None; self_pass=None
-        if q['type']=='program': self_pass=int(bool(p.get('self_pass')))
+        if not isinstance(answer,str) or len(answer)>100000:raise ValueError('答案长度不正确')
+        if q.get('revision') and p.get('revision')!=q['revision']:
+            raise ValueError('题目已更新，请刷新页面后重新选择。原提交记录仍在。')
+        assisted=bool(p.get('assisted'));correct=None;self_pass=None
+        if q['type']=='program':self_pass=int(bool(p.get('self_pass')))
         elif q['type']=='fill':
-            a=re.sub(r'\s+','',answer); b=re.sub(r'\s+','',q['answer'])
+            a=re.sub(r'\s+','',answer);b=re.sub(r'\s+','',q['answer'])
             aliases={'q02b':['9.0','9.','(double)9','9.00']}
             correct=int(a in aliases.get(qid,[b]))
-        else: correct=int(norm(answer)==norm(q['answer']))
-        with LOCK, self.connect() as c:
-            c.execute('INSERT OR IGNORE INTO attempts(event_id,qid,answer,correct,assisted,mode,self_pass,saved_at) VALUES(?,?,?,?,?,?,?,?)',(event,qid,dumps(answer),correct,int(assisted),str(p.get('mode','practice'))[:40],self_pass,now())); c.commit()
-            r=dict(c.execute('SELECT * FROM attempts WHERE event_id=?',(event,)).fetchone()); r['answer']=json.loads(r['answer'])
-        self.daily(); return r
+        else:correct=int(norm(answer)==norm(q['answer']))
+        with LOCK,self.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
+            previous=c.execute('SELECT * FROM attempts WHERE event_id=?',(event,)).fetchone()
+            if previous and previous['qid']!=qid:raise ValueError('提交标识已用于另一道题')
+            was_passed=bool(c.execute('SELECT 1 FROM attempts WHERE qid=? AND (correct=1 OR self_pass=1) LIMIT 1',(qid,)).fetchone())
+            stored_answer=f'{q["revision"]}:{answer}' if q.get('revision') else answer
+            c.execute('INSERT OR IGNORE INTO attempts(event_id,qid,answer,correct,assisted,mode,self_pass,saved_at) VALUES(?,?,?,?,?,?,?,?)',(event,qid,dumps(stored_answer),correct,int(assisted),str(p.get('mode','practice'))[:40],self_pass,now()))
+            key='draft:'+qid;row=c.execute('SELECT value FROM records WHERE key=?',(key,)).fetchone();draft=json.loads(row[0]) if row else {}
+            if not previous and not was_passed and (correct==1 or self_pass==1):
+                title=next(l.get('practice_title',l['title']) for l in COURSE['lessons'] if l['id']==q['lesson'])
+                praise_id,message=choose_praise('pass',event,used_praise(c),title)
+                draft.update(earned_praise=message,earned_praise_id=praise_id,earned_praise_event=event,first_passed_at=now())
+                c.execute('INSERT INTO records VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated=excluded.updated',(key,dumps(draft),now()))
+            c.commit()
+            result=dict(c.execute('SELECT * FROM attempts WHERE event_id=?',(event,)).fetchone());result['answer']=json.loads(result['answer'])
+            if draft.get('earned_praise_event')==event:result['praise']=draft['earned_praise']
+        self.daily();return result
+
+    def solution(self,qid,revision=None):
+        if qid not in QUESTIONS:raise ValueError('没有找到题目')
+        current=QUESTIONS[qid]
+        revision=revision or current.get('revision','legacy')
+        q=current if revision==current.get('revision','legacy') else QUESTION_ARCHIVE.get(qid,{}).get(revision)
+        if q is None:raise ValueError('没有找到该题的历史版本')
+        with LOCK,self.connect() as c:
+            answers=[json.loads(row[0]) for row in c.execute('SELECT answer FROM attempts WHERE qid=? AND (correct=1 OR self_pass=1)',(qid,))]
+        def same_version(answer):
+            if revision=='legacy':return not re.match(r'^v[0-9]+:',str(answer))
+            return str(answer).startswith(revision+':')
+        if not any(same_version(a) for a in answers):return {'unlocked':False,'message':'通过这一版题目后解锁这一版答案；旧版通过资格仍计入课程进度。'}
+        result={k:q[k] for k in ('answer','reference','expected','explanation','solution_steps','tests','reference_walk43') if k in q}
+        return {'unlocked':True,'solution':result,'revision':revision}
+
+    def question_history(self,qid):
+        if qid not in QUESTIONS:raise ValueError('没有找到题目')
+        versions=[]
+        for revision,q in QUESTION_ARCHIVE.get(qid,{}).items():
+            versions.append({'revision':revision,'question':public_question(q),**self.solution(qid,revision)})
+        return {'versions':versions}
+
     def backup(self,kind='manual'):
         self.ensure()
         with LOCK:
-            name=f'daily-{dt.date.today().isoformat()}.sqlite' if kind=='daily' else f'{kind}-{dt.datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}.sqlite'
+            path=self.folder/'retention-v4.json'
+            try: policy=json.loads(path.read_text(encoding='utf-8'))
+            except FileNotFoundError: policy={'protected':[f.name for f in self.bdir.glob('*.sqlite')],'managed':{}}
+            day=dt.date.today().isoformat()
+            name=f'daily-{day}.sqlite' if kind=='daily' else f'{kind}-v4-{day}.sqlite' if kind!='manual' else f'manual-{dt.datetime.now():%Y%m%d-%H%M%S-%f}-{uuid.uuid4().hex[:6]}.sqlite'
             dest=self.bdir/name
-            if not dest.exists():
+            # Never replace pre-policy snapshots, even when names coincide.
+            if name in policy['protected']:
+                name=f'{kind}-v4-{day}.sqlite';dest=self.bdir/name
+            unchanged=kind=='daily' and dest.exists()
+            if not unchanged:
                 temp=self.bdir/(name+'.tmp')
                 try:
-                    with self.connect() as src, closing(sqlite3.connect(temp)) as out: src.backup(out)
+                    with self.connect() as src, closing(sqlite3.connect(temp)) as out:src.backup(out)
                     os.replace(temp,dest)
                 finally:
-                    if temp.exists(): temp.unlink()
-            daily=sorted(self.bdir.glob('daily-*.sqlite'),reverse=True)
-            for old in daily[30:]: old.unlink()
-            self.warning=''; self.sync_secondary()
-            return name
+                    if temp.exists():temp.unlink()
+            policy['managed'][name]={'kind':kind,'date':day}
+            manual=sorted((n for n,v in policy['managed'].items() if v['kind']=='manual'),reverse=True)
+            expired=[n for n,v in policy['managed'].items() if v['kind']!='manual' and (dt.date.today()-dt.date.fromisoformat(v['date'])).days>=30]+manual[10:]
+            policy['removed']=list(set(policy.get('removed',[])+expired))
+            for name0 in expired:
+                if name0 in policy['protected']:continue
+                target=self.bdir/name0
+                if target.parent.resolve()!=self.bdir.resolve() or target.is_symlink():continue
+                target.unlink(missing_ok=True);policy['managed'].pop(name0,None)
+            temp=path.with_suffix('.tmp');temp.write_text(dumps(policy),encoding='utf-8');os.replace(temp,path)
+            self.warning='';self.sync_secondary();return name
     def daily(self):
         try: self.backup('daily')
         except Exception as e: self.warning='主数据已保存，但自动备份失败：'+str(e)
@@ -125,6 +223,13 @@ class Store:
                 other=target/f.name
                 if not other.exists() or other.stat().st_size!=f.stat().st_size:
                     temp=target/(f.name+'.tmp'); shutil.copy2(f,temp); os.replace(temp,other)
+            policy_path=self.folder/'retention-v4.json'
+            if policy_path.exists():
+                policy=json.loads(policy_path.read_text(encoding='utf-8'))
+                for name in policy.get('removed',[]):
+                    if name in policy.get('protected',[]) or Path(name).name!=name:continue
+                    other=target/name
+                    if other.parent.resolve()==target.resolve() and not other.is_symlink():other.unlink(missing_ok=True)
             self.secondary_warning=''
         except Exception as e: self.secondary_warning='第二位置尚未更新：'+str(e)
     def set_secondary(self,directory):
@@ -138,7 +243,7 @@ class Store:
         temp=self.settings_path.with_suffix('.tmp'); temp.write_text(dumps(self.settings),encoding='utf-8'); os.replace(temp,self.settings_path)
         self.sync_secondary(); return self.meta()
     def list_backups(self):
-        return [dict(name=f.name,size=f.stat().st_size,time=dt.datetime.fromtimestamp(f.stat().st_mtime).astimezone().isoformat(timespec='seconds')) for f in sorted(self.bdir.glob('*.sqlite'),key=lambda p:p.stat().st_mtime,reverse=True)]
+        return [dict(name=f.name,size=f.stat().st_size,time=dt.datetime.fromtimestamp(f.stat().st_mtime).astimezone().isoformat(timespec='microseconds')) for f in sorted(self.bdir.glob('*.sqlite'),key=lambda p:p.stat().st_mtime,reverse=True)]
     def meta(self):
         with LOCK:
             b=self.list_backups()
@@ -151,7 +256,7 @@ class Store:
         records=p.get('records'); attempts=p.get('attempts')
         if not isinstance(records,dict) or not isinstance(attempts,list) or len(records)>5000 or len(attempts)>100000: raise ValueError('备份记录结构或数量不正确')
         for k,r in records.items():
-            if not isinstance(k,str) or not re.fullmatch(r'(profile|lesson:l\d{2}|draft:q\d{2}[abc]|paper:(paper[123]|diagnostic)|scope:\d{1,2}|checkin:\d{4}-\d{2}-\d{2})',k) or not isinstance(r,dict) or not isinstance(r.get('value'),dict): raise ValueError('备份中的学习记录不正确')
+            if not isinstance(k,str) or not re.fullmatch(r'(profile|lesson:l\d{2}|draft:(?:q\d{2}[abc]|[hd]\d{2}[a-h])|paper:(paper[123]|diagnostic)|scope:\d{1,2}|checkin:\d{4}-\d{2}-\d{2})',k) or not isinstance(r,dict) or not isinstance(r.get('value'),dict): raise ValueError('备份中的学习记录不正确')
         for k,r in records.items():
             if k.startswith('checkin:'):
                 dt.date.fromisoformat(k[8:])
@@ -177,7 +282,7 @@ class Store:
                     c.commit()
                     if c.execute('PRAGMA integrity_check').fetchone()[0]!='ok': raise ValueError('恢复文件完整性检查失败')
                 if self.broken:
-                    if self.db.exists(): shutil.copy2(self.db,self.folder/f'learning-damaged-{dt.datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}.sqlite')
+                    if self.db.exists(): shutil.copy2(self.db,self.folder/f'learning-damaged-{dt.datetime.now():%Y%m%d-%H%M%S-%f}-{uuid.uuid4().hex[:6]}.sqlite')
                 else: self.backup('before-restore')
                 os.replace(temp,self.db); self.broken=False; self.warning=''; self.backup('restored')
             finally:
@@ -195,18 +300,17 @@ class Store:
         return self.import_data(p)
 
     def checkin(self):
-        self.ensure(); date=dt.date.today().isoformat(); key='checkin:'+date
-        with LOCK, self.connect() as c:
-            c.execute('BEGIN IMMEDIATE')
-            row=c.execute('SELECT value FROM records WHERE key=?',(key,)).fetchone()
-            value=json.loads(row[0]) if row else {}
+        self.ensure();date=dt.date.today().isoformat();key='checkin:'+date;created=False
+        with LOCK,self.connect() as c:
+            c.execute('BEGIN IMMEDIATE');row=c.execute('SELECT value FROM records WHERE key=?',(key,)).fetchone();value=json.loads(row[0]) if row else {}
             if not value.get('signed_at'):
                 count=c.execute("SELECT count(*) FROM records WHERE key LIKE 'checkin:%' AND json_extract(value,'$.signed_at') != ''").fetchone()[0]+1
-                cheers=['你给今天的学习留了一个位置。哪怕只想明白一个问题，也可以从这里接着走。','今天的收获已经收好。下次回来，不必从头找，你留下的思路还在这里。','愿意停下来记一笔，说明你在认真对待自己的学习。这一天，给自己一点肯定。','做题、读代码、改错误，都值得留下痕迹。今天这一格，属于你投入的注意力。','有些进步要过几天才看得见。今天记下的疑问，也可能是下一次想通的起点。','这份记录没有替你走路，但会记住你来过。今天学到的内容，可以慢慢消化。','今天这一笔已保存。带着一点新的理解离开，也是一种踏实的结束。']
-                value.update(date=date,signed_at=now(),ordinal=count,cheer=cheers[(count-1)%len(cheers)],cheer_id=(count-1)%len(cheers))
-                stamp=now();c.execute('INSERT INTO records VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated=excluded.updated',(key,dumps(value),stamp));c.commit()
-            else: c.rollback()
-        self.daily();return {'key':key,'value':value,'saved_at':now()}
+                cheer_id,cheer=choose_praise('checkin',date,used_praise(c))
+                value.update(date=date,signed_at=now(),ordinal=count,cheer=cheer,cheer_id=cheer_id)
+                stamp=now();c.execute('INSERT INTO records VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated=excluded.updated',(key,dumps(value),stamp));c.commit();created=True
+            else:c.rollback()
+        self.daily();return {'key':key,'value':value,'saved_at':now(),'newly_signed':created}
+
 
 class Handler(BaseHTTPRequestHandler):
     server_version='CStudyLocal/1.0'
@@ -232,7 +336,9 @@ class Handler(BaseHTTPRequestHandler):
             if path=='/api/export':
                 data=json.dumps(STORE.export(),ensure_ascii=False,indent=2).encode('utf-8')
                 self.send_response(200); self.headers_common(); self.send_header('Content-Type','application/json; charset=utf-8'); self.send_header('Content-Disposition',f'attachment; filename="CStudy-backup-{dt.date.today()}.json"'); self.send_header('Content-Length',str(len(data))); self.end_headers(); self.wfile.write(data); return
-            names={'/':'index.html','/index.html':'index.html','/style.css':'style.css','/app.js':'app.js','/course.json':'course.json','/favicon.svg':'favicon.svg'}
+            if path=='/course.json':self.reply(public_content(COURSE));return
+            if path=='/practice.json':self.reply(public_content(PRACTICE));return
+            names={'/':'index.html','/index.html':'index.html','/style.css':'style.css','/study-v43.css':'study-v43.css','/app.js':'app.js','/study-v41.js':'study-v41.js','/study-v42.js':'study-v42.js','/study-v43.js':'study-v43.js','/code-editor.js':'code-editor.js','/course.json':'course.json','/favicon.svg':'favicon.svg','/practice.json':'practice.json'}
             filename=names.get(path)
             if not filename: self.reply({'error':'页面不存在'},404); return
             file=APP/filename
@@ -261,6 +367,8 @@ class Handler(BaseHTTPRequestHandler):
                     elif route=='/api/update/prepare':UPDATE['phase']='preparing'
                     elif route=='/api/update/cancel':UPDATE['phase']='idle'
                     elif route=='/api/update/freeze':
+                        if not JUDGE_GATE.acquire(blocking=False):raise ValueError('本机判题尚未结束')
+                        JUDGE_GATE.release()
                         active=[v for v in UPDATE['clients'].values() if time.monotonic()-v['seen']<12]
                         if any(not v.get('ready') or v.get('pending') for v in active):raise ValueError('仍有页面正在保存，请稍后重试')
                         UPDATE['phase']='frozen'
@@ -274,8 +382,22 @@ class Handler(BaseHTTPRequestHandler):
                 target=STORE.folder/f'unsaved-before-restore-{dt.datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}.json'
                 target.write_text(json.dumps(pending,ensure_ascii=False,indent=2),encoding='utf-8')
             if route=='/api/record': value=STORE.patch(p.get('key',''),p.get('patch',{}))
+            elif route=='/api/solution':value=STORE.solution(p.get('qid'),p.get('revision'))
+            elif route=='/api/question-history':value=STORE.question_history(p.get('qid'))
             elif route=='/api/checkin':value=STORE.checkin()
             elif route=='/api/attempt': value=STORE.attempt(p)
+            elif route=='/api/format-code': value=format_code(p.get('code'),p.get('cursor'))
+            elif route=='/api/judge':
+                q=QUESTIONS.get(p.get('qid'))
+                if not q or not q.get('judge'):raise ValueError('本题没有配置本机测试')
+                if p.get('revision','legacy')!=q.get('revision','legacy'):raise ValueError('题目版本已更新，代码草稿仍保留；请刷新后检查对应新版。')
+                result=judge(p.get('answer'),q,environment()['compiler'])
+                with LOCK:
+                    if UPDATE['phase']=='frozen':raise ValueError('正在更新，请稍后重新检查')
+                    payload=dict(p,self_pass=result['passed'])
+                    attempt=STORE.attempt(payload,verified=True)
+                value=dict(judgement=result,attempt=attempt)
+
             elif route=='/api/backup': value={'name':STORE.backup(), 'meta':STORE.meta()}
             elif route=='/api/secondary': value=STORE.set_secondary(str(p.get('path','')).strip())
             elif route=='/api/import': value={'state':STORE.import_data(p.get('data')), 'meta':STORE.meta()}
@@ -289,14 +411,58 @@ class Handler(BaseHTTPRequestHandler):
         except (ConnectionError,BrokenPipeError): pass
         except Exception as e: traceback.print_exc(); self.reply({'error':'操作失败：'+str(e)},500)
 
+@lru_cache(maxsize=1)
+def formatter_path():
+    local=ROOT/'formatter'/'clang-format.exe'
+    if local.is_file():return str(local)
+    bundled=Path.home()/'.vscode'/'extensions'
+    matches=sorted(bundled.glob('ms-vscode.cpptools-*/LLVM/bin/clang-format.exe'),reverse=True)
+    return str(matches[0]) if matches else shutil.which('clang-format')
+
+def format_code(code,cursor):
+    if not isinstance(code,str) or not code.strip() or len(code)>100000 or '\0' in code:
+        raise ValueError('请输入要整理的 C 代码，大小不超过 100 KB。')
+    source=code.encode('utf-8')
+    if len(source)>100000 or type(cursor) is not int or not 0<=cursor<=len(source):
+        raise ValueError('代码过长或光标位置无效。')
+    formatter=formatter_path()
+    if not formatter:
+        raise ValueError('本机暂未找到 C 代码格式化工具。')
+    style=dumps({
+        'BasedOnStyle':'LLVM','IndentWidth':4,'UseTab':'Never','SortIncludes':'Never',
+        'BreakStringLiterals':False,'ReflowComments':False,'ColumnLimit':0,'IndentCaseLabels':True,
+        'AllowShortIfStatementsOnASingleLine':'Never','AllowShortLoopsOnASingleLine':False,
+        'AllowShortBlocksOnASingleLine':'Never','AllowShortFunctionsOnASingleLine':'None',
+    })
+    try:
+        output=subprocess.run(
+            [formatter,'--assume-filename=answer.c','--style='+style,
+             '--cursor='+str(cursor),'--fail-on-incomplete-format'],
+            input=source,capture_output=True,timeout=4,
+            creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0),
+        )
+    except (OSError,subprocess.TimeoutExpired) as error:
+        raise ValueError('暂时无法整理代码，请稍后重试。') from error
+    if output.returncode:
+        raise ValueError('这段代码暂时无法整理。可以先补齐引号或括号再试。')
+    header,_,formatted=output.stdout.partition(b'\n')
+    if len(formatted)>100000:
+        raise ValueError('整理后的代码超过 100 KB，已保留原代码。')
+    position=json.loads(header)['Cursor']
+    return {'code':formatted.decode('utf-8'),'cursor':position}
+
 def environment():
-    gcc=shutil.which('gcc') or (r'D:\develop\mingw64\bin\gcc.exe' if Path(r'D:\develop\mingw64\bin\gcc.exe').exists() else '')
+    local=ROOT/'compiler'/'bin'/'gcc.exe'
+    gcc=str(local) if local.is_file() else shutil.which('gcc') or (r'D:\develop\mingw64\bin\gcc.exe' if Path(r'D:\develop\mingw64\bin\gcc.exe').exists() else '')
     code=shutil.which('code') or (r'D:\VSCode-win32-x64-1.129.1\Code.exe' if Path(r'D:\VSCode-win32-x64-1.129.1\Code.exe').exists() else '')
     version=''
     if gcc:
         try: version=subprocess.run([gcc,'--version'],capture_output=True,text=True,timeout=5,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0)).stdout.splitlines()[0]
         except Exception: pass
-    return {'compiler':gcc,'compiler_version':version,'vscode':code,'python':sys.version.split()[0]}
+    return {'compiler':gcc,'compiler_version':version,'vscode':code,'code_formatter':bool(formatter_path()),'python':sys.version.split()[0]}
+
+class LocalHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = os.name != 'nt'
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser(); parser.add_argument('--port',type=int,default=8871); parser.add_argument('--data-dir',default=str(ROOT/'user-data')); parser.add_argument('--no-port-fallback',action='store_true'); parser.add_argument('--update-start',action='store_true'); args=parser.parse_args()
@@ -304,7 +470,7 @@ if __name__=='__main__':
     STORE=Store(args.data_dir); ENV=environment()
     server=None
     for port in [args.port] if args.no_port_fallback else range(args.port,args.port+10):
-        try: server=ThreadingHTTPServer(('127.0.0.1',port),Handler); break
+        try: server=LocalHTTPServer(('127.0.0.1',port),Handler); break
         except OSError: continue
     if not server: raise SystemExit('没有可用的本机端口')
     runtime=STORE.folder/'server.json'; runtime.write_text(dumps(dict(port=server.server_port,pid=os.getpid(),root=str(ROOT),started=now())),encoding='utf-8')
@@ -322,3 +488,4 @@ if __name__=='__main__':
         try:
             if json.loads(runtime.read_text(encoding='utf-8')).get('pid')==os.getpid(): runtime.unlink(missing_ok=True)
         except Exception: pass
+

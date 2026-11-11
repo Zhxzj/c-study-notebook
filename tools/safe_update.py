@@ -50,7 +50,7 @@ def main():
     new=json.loads((source/'course.json').read_text(encoding='utf-8'));old=json.loads((app/'course.json').read_text(encoding='utf-8'));contract=json.loads((source/'data-contract.json').read_text(encoding='utf-8'))
     if contract.get('schema')!=1:raise RuntimeError('数据结构变更需要单独迁移；本更新器不会重建数据库')
     lids=lambda c:{l['id'] for l in c['lessons']}
-    qids=lambda c:{q['id'] for l in c['lessons'] for q in l['questions']}|{q['id'] for q in c.get('extra_questions',[])}
+    qids=lambda c:{q['id'] for l in c['lessons'] for q in l['questions']}|{q['id'] for q in c.get('extra_questions',[])}|set(c.get('data_contract',{}).get('stable_question_ids',[]))
     if not lids(old)<=lids(new) or not qids(old)<=qids(new):raise RuntimeError('更新包删除或重命名了已有课程／题目编号，拒绝更新')
     existing=data_state(db);types={r[0].split(':')[0] for r in existing['records']}
     if not types<=set(contract.get('record_types',[])):raise RuntimeError('更新包不支持已经保存的记录类型')
@@ -88,6 +88,17 @@ def main():
         request(base,'/api/backup',{},boot['token'])
         report=dict(ok=True,version=new['version'],records=len(after['records']),attempts=len(after['attempts']),data_digest=digest(after),snapshot=str(archive/'learning-before.sqlite'),previous_app=str(previous),updated_at=dt.datetime.now().astimezone().isoformat())
         (archive/'update-result.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+        # Keep pre-policy snapshots; rotate only subsequent successful updates.
+        policy_path=root/'updates-retention-v4.json'
+        try:policy=json.loads(policy_path.read_text(encoding='utf-8'))
+        except FileNotFoundError:policy={'protected':[f.name for f in (root/'updates').iterdir() if f.is_dir() and f!=archive],'managed':[]}
+        if archive.name not in policy['managed']:policy['managed'].append(archive.name)
+        for name in policy['managed'][:-3]:
+            target=confined(root/'updates'/name,root/'updates')
+            if name not in policy['protected'] and target.is_dir() and not any(f.is_symlink() for f in target.rglob('*')):
+                shutil.rmtree(target)
+        policy['managed']=policy['managed'][-3:]
+        policy_path.write_text(json.dumps(policy,ensure_ascii=False,indent=2),encoding='utf-8')
         print(json.dumps(report,ensure_ascii=False))
     except Exception:
         if swapped:

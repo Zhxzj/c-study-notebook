@@ -11,8 +11,8 @@ function Read-StudyServer {
         try{
             $info=Get-Content -LiteralPath $studyStateFile -Raw -Encoding UTF8 | ConvertFrom-Json
             if($info.root -ne $studyRoot){return $null}
-            $health=Invoke-RestMethod -Uri ('http://127.0.0.1:'+ $info.port +'/api/health') -TimeoutSec 2
-            if($health.app -eq 'cstudy-local'){return $info}
+            $health=Invoke-RestMethod -Uri ('http://127.0.0.1:'+ $info.port +'/api/bootstrap') -TimeoutSec 2
+            if($health.meta.data_path -eq (Join-Path $studyData 'learning.sqlite')){return $info}
         }catch{}
     }
     return $null
@@ -57,4 +57,5 @@ try{
     if($studyLocked){$studyMutex.ReleaseMutex()}
     $studyMutex.Dispose()
 }
+
 

@@ -1,0 +1,22 @@
+/* 4.3: more explanation without covering the lesson with a modal. */
+.syntax-panel{width:min(640px,calc(100vw - 32px));max-height:min(82vh,850px);overflow:auto;overscroll-behavior:contain}
+.syntax-panel p,.syntax-panel li{font-size:15px;line-height:1.8}
+.syntax-panel header{position:sticky;top:0;background:#fff;z-index:1;padding:8px 0 12px}
+.syntax-panel .annotated-example{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.85;font-size:13px}
+.usage-purpose{color:#1d1d1f}.usage-parts{padding-left:24px}.usage-parts li+li{margin-top:12px}
+.usage-result{background:#f0f6ff;border-radius:12px;padding:16px}.usage-result strong{display:block;margin-bottom:6px}
+.usage-walk article,.line-guide43 article{border-top:1px solid #e5e5ea;padding:16px 0}
+.usage-walk article code,.line-guide43 article code{display:block;white-space:pre-wrap;overflow-wrap:anywhere;font-size:14px}
+.usage-walk article p,.line-guide43 article p{margin:8px 0 0}
+.line-guide43,.reading-checks43,.safety-lessons43{margin:32px 0}.line-guide43>summary,.reading-checks43 details>summary,.safety-lessons43 details>summary{padding:20px 0;font-weight:600;cursor:pointer}
+.reading-checks43 details,.safety-lessons43 details{border-top:1px solid #dedee5}.reading-checks43 details .code-block{margin-top:8px}
+.trace-detail43{padding:20px 0}.trace-detail43>p{font-size:16px;line-height:1.8}
+.trace-decision43{font-weight:600;color:#0066cc}.trace-state43{margin:20px 0;max-width:100%}
+.trace-state43 table{min-width:440px;width:100%;font-size:13px;table-layout:fixed}
+.trace-state43 th,.trace-state43 td{padding:12px 10px;vertical-align:top;overflow-wrap:anywhere;white-space:pre-wrap;font-weight:400;text-align:left}
+.trace-state43 thead th{font-weight:600}.trace-state43 th:first-child{width:25%}.state-changed43{background:#eef6ff}
+.trace-output43{padding:16px;background:#f5f5f7;border-radius:14px}.trace-output43 strong{font-size:13px;color:#6e6e73}.trace-output43 pre{margin:10px 0 0;white-space:pre-wrap;overflow-wrap:anywhere}
+.full-trace43 .table-wrap{max-height:600px;overflow:auto}.full-trace43 table{min-width:800px}.full-trace43 td{vertical-align:top;font-size:13px}.full-trace43 td code{white-space:pre-wrap}.full-trace43 td pre{white-space:pre-wrap}
+.code-study .code-line:has(.syn-comment),.execution-code .code-line:has(.syn-comment){white-space:pre-wrap;overflow-wrap:anywhere}
+.edition-note43{margin:24px 0;padding:18px 22px;border:1px solid #e2e2e8;background:#fafafa;border-radius:16px}.edition-note43>p{font-size:14px;color:#6e6e73;margin:0 0 12px}.edition-note43 summary{cursor:pointer;font-size:14px}.history-content43>article{margin-top:20px}.historical-answer43{max-height:300px;overflow:auto;white-space:pre-wrap}
+@media(max-width:780px){.syntax-panel{position:static!important;width:100%;max-height:75vh;margin-top:12px}.trace-state43 th,.trace-state43 td{padding:10px 8px}.edition-note43{padding:16px}.trace-actions{flex-wrap:wrap;gap:14px}}

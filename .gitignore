@@ -5,3 +5,9 @@ __pycache__/
 *.sqlite*
 *.log
 server.json
+
+distribution/
+outputs/
+compiler/
+formatter/
+installation-result.json
